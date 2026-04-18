@@ -7,7 +7,7 @@
 *.dll
 *.so
 *.dylib
-bin/
+dist/
 errdoc
 
 # Test binary, built with `go test -c`

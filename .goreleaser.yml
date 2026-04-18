@@ -1,0 +1,20 @@
+version: 2
+
+builds:
+  - id: errdoc
+    main: ./cmd/errdoc
+    binary: errdoc
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - name_template: "errdoc_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    ids:
+      - errdoc
