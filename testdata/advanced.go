@@ -1,4 +1,4 @@
-package main
+package testdata
 
 import (
 	"encoding/json"
@@ -8,9 +8,6 @@ import (
 	"os"
 	"strconv"
 )
-
-// Ensure no duplicate main.
-func init() {}
 
 // PermissionError is a concrete error type with a pointer receiver.
 type PermissionError struct {

@@ -1,4 +1,4 @@
-package main
+package testdata
 
 import (
 	"fmt"
@@ -46,5 +46,3 @@ func multipleErrors() error {
 func noErrors() {
 	fmt.Println("hello")
 }
-
-func main() {}

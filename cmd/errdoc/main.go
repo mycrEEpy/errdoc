@@ -1,8 +1,10 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"os"
 	"sort"
@@ -30,23 +32,29 @@ type funcEntry struct {
 	info *types.Info
 }
 
+const errDocPrefix = "// Returns errors:"
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Printf("usage: errdoc <file.go|directory>\n")
+	writeFlag := flag.Bool("w", false, "write error types into function doc comments")
+	flag.Usage = func() {
+		fmt.Printf("usage: errdoc [-w] <file.go|directory>\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	if flag.NArg() < 1 {
+		flag.Usage()
 		os.Exit(1)
 	}
-
-	target := os.Args[1]
+	target := flag.Arg(0)
 
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedDeps | packages.NeedImports,
 	}
 
-	// Determine whether target is a directory or a single file.
 	var query string
 	var isDir bool
-
 	if info, err := os.Stat(target); err == nil && info.IsDir() {
 		query = "./" + target
 		isDir = true
@@ -59,7 +67,6 @@ func main() {
 		fmt.Printf("load: %v\n", err)
 		os.Exit(1)
 	}
-
 	if len(pkgs) == 0 {
 		fmt.Printf("no packages found\n")
 		os.Exit(1)
@@ -70,7 +77,6 @@ func main() {
 		for _, e := range pkg.Errors {
 			fmt.Printf("%v\n", e)
 		}
-
 		os.Exit(1)
 	}
 
@@ -78,7 +84,6 @@ func main() {
 	a.indexPkg(pkg)
 
 	var files []*ast.File
-
 	if isDir {
 		files = pkg.Syntax
 	} else {
@@ -87,12 +92,15 @@ func main() {
 			fmt.Printf("file %s not found in package\n", target)
 			os.Exit(1)
 		}
-
 		files = []*ast.File{f}
 	}
 
-	for _, file := range files {
-		a.printFileErrors(file, pkg.TypesInfo)
+	if *writeFlag {
+		a.writeFileErrors(files, pkg)
+	} else {
+		for _, file := range files {
+			a.printFileErrors(file, pkg.TypesInfo)
+		}
 	}
 }
 
@@ -131,6 +139,178 @@ func (a *analyzer) printFileErrors(file *ast.File, info *types.Info) {
 			fmt.Printf("  %s\n", e)
 		}
 	}
+}
+
+// writeFileErrors analyzes every function in the given files and writes
+// the concrete error types into each function's doc comment. Existing
+// "Returns errors:" blocks are replaced; new ones are inserted.
+// funcResult pairs a function declaration with its sorted error type names.
+type funcResult struct {
+	decl *ast.FuncDecl
+	errs []string
+}
+
+func (a *analyzer) writeFileErrors(files []*ast.File, pkg *packages.Package) {
+	byFile := make(map[string][]funcResult)
+
+	for _, file := range files {
+		filePath := pkg.Fset.Position(file.Pos()).Filename
+		for _, decl := range file.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			errs := a.analyzeFunc(fd, pkg.TypesInfo)
+			byFile[filePath] = append(byFile[filePath], funcResult{decl: fd, errs: sortedKeys(errs)})
+		}
+	}
+
+	for filePath, results := range byFile {
+		src, err := os.ReadFile(filePath)
+		if err != nil {
+			fmt.Printf("read %s: %v\n", filePath, err)
+			continue
+		}
+		src = rewriteSource(src, results, pkg.Fset)
+		if err := os.WriteFile(filePath, src, 0644); err != nil {
+			fmt.Printf("write %s: %v\n", filePath, err)
+		}
+	}
+}
+
+// rewriteSource applies error doc edits to src, processing functions from
+// bottom to top so that earlier byte offsets remain valid.
+func rewriteSource(src []byte, results []funcResult, fset *token.FileSet) []byte {
+	// Process from bottom to top to preserve offsets.
+	for i := len(results) - 1; i >= 0; i-- {
+		r := results[i]
+		src = rewriteFuncDoc(src, r.decl, r.errs, fset)
+	}
+	return src
+}
+
+// rewriteFuncDoc updates or inserts the "Returns errors:" block in the
+// doc comment of a single function declaration.
+func rewriteFuncDoc(src []byte, fd *ast.FuncDecl, errs []string, fset *token.FileSet) []byte {
+	errBlock := buildErrBlock(errs)
+	funcOff := fset.Position(fd.Pos()).Offset
+
+	// Scan backwards from the func keyword to find an existing error block
+	// in the raw source, independent of AST doc comment attachment.
+	blockStart, blockEnd := findErrBlockBytes(src, funcOff)
+	if blockStart >= 0 {
+		if errBlock == "" {
+			// Remove the block and the following newline.
+			removeEnd := blockEnd
+			if removeEnd < len(src) && src[removeEnd] == '\n' {
+				removeEnd++
+			}
+			return splice(src, blockStart, removeEnd, "")
+		}
+		return splice(src, blockStart, blockEnd, errBlock)
+	}
+
+	if errBlock == "" {
+		return src
+	}
+
+	if fd.Doc != nil && len(fd.Doc.List) > 0 {
+		// Append after last doc comment line.
+		last := fd.Doc.List[len(fd.Doc.List)-1]
+		insertOff := fset.Position(last.End()).Offset
+		return splice(src, insertOff, insertOff, "\n"+errBlock)
+	}
+
+	// No existing doc comment — insert before the func keyword.
+	return splice(src, funcOff, funcOff, errBlock+"\n")
+}
+
+// buildErrBlock builds the "// Returns errors:" comment block text.
+// Returns an empty string if there are no errors.
+func buildErrBlock(errs []string) string {
+	if len(errs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(errDocPrefix)
+	b.WriteString("\n//")
+	for _, e := range errs {
+		b.WriteString("\n//   ")
+		b.WriteString(e)
+	}
+	return b.String()
+}
+
+// findErrBlockBytes scans the raw source backwards from funcOff to find
+// an existing "Returns errors:" block. It returns the byte range
+// [start, end) covering the entire block, or -1, -1 if not found.
+func findErrBlockBytes(src []byte, funcOff int) (int, int) {
+	// Walk backwards over comment lines immediately preceding the func.
+	lines := strings.Split(string(src[:funcOff]), "\n")
+	// Drop the last element (the func line or empty trailing split).
+	if len(lines) > 0 {
+		lines = lines[:len(lines)-1]
+	}
+
+	// Scan upward from the bottom collecting the error block lines.
+	blockEnd := -1
+	blockStart := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			break // blank line means end of contiguous comment
+		}
+		if strings.HasPrefix(trimmed, "//   ") || trimmed == "//" {
+			if blockEnd < 0 {
+				blockEnd = i
+			}
+			blockStart = i
+			continue
+		}
+		if strings.HasPrefix(trimmed, errDocPrefix) {
+			blockStart = i
+			if blockEnd < 0 {
+				blockEnd = i
+			}
+			break
+		}
+		break // some other comment line, stop
+	}
+
+	if blockStart < 0 {
+		return -1, -1
+	}
+
+	// Verify the block actually starts with the prefix.
+	if !strings.HasPrefix(strings.TrimSpace(lines[blockStart]), errDocPrefix) {
+		return -1, -1
+	}
+
+	// Convert line indices back to byte offsets.
+	startOff := 0
+	for i := 0; i < blockStart; i++ {
+		startOff += len(lines[i]) + 1 // +1 for '\n'
+	}
+	endOff := startOff
+	for i := blockStart; i <= blockEnd; i++ {
+		endOff += len(lines[i]) + 1
+	}
+	// Exclude the final newline so the splice preserves the line break
+	// between the block and the func keyword.
+	if endOff > startOff {
+		endOff--
+	}
+
+	return startOff, endOff
+}
+
+// splice replaces src[start:end] with replacement.
+func splice(src []byte, start, end int, replacement string) []byte {
+	var b []byte
+	b = append(b, src[:start]...)
+	b = append(b, replacement...)
+	b = append(b, src[end:]...)
+	return b
 }
 
 // indexPkg recursively indexes all function declarations in pkg and its deps.
@@ -249,7 +429,6 @@ func (a *analyzer) addTypedError(t types.Type, errs map[string]bool) {
 // includes a concrete error type, it's added directly. If it returns the bare
 // error interface, we recurse into the callee's source to find concrete types.
 func (a *analyzer) addCallErrors(call *ast.CallExpr, info *types.Info, errs map[string]bool) {
-	// Check if any return type in the signature is a concrete error.
 	t := info.TypeOf(call)
 	if t == nil {
 		return
@@ -280,7 +459,6 @@ func (a *analyzer) addCallErrors(call *ast.CallExpr, info *types.Info, errs map[
 		collectFromType(t)
 	}
 
-	// If the signature returns bare `error`, recurse into the callee.
 	if !hasBareErr {
 		return
 	}
@@ -295,7 +473,7 @@ func (a *analyzer) addCallErrors(call *ast.CallExpr, info *types.Info, errs map[
 	}
 }
 
-// resolveCallee resolves a call expression to its *types.Func, if possible.
+// resolveCallee resolves a call expression to its [types.Func], if possible.
 func resolveCallee(call *ast.CallExpr, info *types.Info) *types.Func {
 	var obj types.Object
 
