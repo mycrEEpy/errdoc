@@ -18,11 +18,12 @@ import (
 // caches results to avoid redundant work. A visited set prevents
 // infinite recursion on cyclic call graphs.
 type analyzer struct {
-	errInterface *types.Interface
-	errType      types.Type
-	funcIndex    map[*types.Func]funcEntry
-	funcCache    map[*types.Func]map[string]bool
-	visited      map[*types.Func]bool // cycle detection
+	errInterface   *types.Interface
+	errType        types.Type
+	funcIndex      map[*types.Func]funcEntry
+	funcCache      map[*types.Func]map[string]bool
+	visited        map[*types.Func]bool // cycle detection
+	showUnexported bool
 }
 
 // funcEntry pairs a function declaration's AST node with the type
@@ -36,8 +37,9 @@ const errDocPrefix = "// Returns errors:"
 
 func main() {
 	writeFlag := flag.Bool("w", false, "write error types into function doc comments")
+	unexportedFlag := flag.Bool("u", false, "include unexported error types in output")
 	flag.Usage = func() {
-		fmt.Printf("usage: errdoc [-w] <file.go|directory>\n")
+		fmt.Printf("usage: errdoc [-w] [-u] <file.go|directory>\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -80,7 +82,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	a := newAnalyzer()
+	a := newAnalyzer(*unexportedFlag)
 	a.indexPkg(pkg)
 
 	var files []*ast.File
@@ -105,13 +107,14 @@ func main() {
 }
 
 // newAnalyzer creates an analyzer ready to index packages and collect errors.
-func newAnalyzer() *analyzer {
+func newAnalyzer(showUnexported bool) *analyzer {
 	return &analyzer{
-		errInterface: types.Universe.Lookup("error").Type().Underlying().(*types.Interface),
-		errType:      types.Universe.Lookup("error").Type(),
-		funcIndex:    make(map[*types.Func]funcEntry),
-		funcCache:    make(map[*types.Func]map[string]bool),
-		visited:      make(map[*types.Func]bool),
+		errInterface:   types.Universe.Lookup("error").Type().Underlying().(*types.Interface),
+		errType:        types.Universe.Lookup("error").Type(),
+		funcIndex:      make(map[*types.Func]funcEntry),
+		funcCache:      make(map[*types.Func]map[string]bool),
+		visited:        make(map[*types.Func]bool),
+		showUnexported: showUnexported,
 	}
 }
 
@@ -124,7 +127,7 @@ func (a *analyzer) printFileErrors(file *ast.File, info *types.Info) {
 			continue
 		}
 
-		errs := a.analyzeFunc(fd, info)
+		errs := a.filterErrors(a.analyzeFunc(fd, info))
 		if len(errs) == 0 {
 			continue
 		}
@@ -160,7 +163,7 @@ func (a *analyzer) writeFileErrors(files []*ast.File, pkg *packages.Package) {
 			if !ok {
 				continue
 			}
-			errs := a.analyzeFunc(fd, pkg.TypesInfo)
+			errs := a.filterErrors(a.analyzeFunc(fd, pkg.TypesInfo))
 			byFile[filePath] = append(byFile[filePath], funcResult{decl: fd, errs: sortedKeys(errs)})
 		}
 	}
@@ -535,4 +538,36 @@ func sortedKeys(m map[string]bool) []string {
 	sort.Strings(keys)
 
 	return keys
+}
+
+// filterErrors returns a copy of errs with unexported types removed,
+// unless showUnexported is set. A type is considered exported if its
+// name (after the package path and optional * prefix) starts with an
+// uppercase letter.
+func (a *analyzer) filterErrors(errs map[string]bool) map[string]bool {
+	if a.showUnexported {
+		return errs
+	}
+	filtered := make(map[string]bool)
+	for e := range errs {
+		if isExportedError(e) {
+			filtered[e] = true
+		}
+	}
+	return filtered
+}
+
+// isExportedError reports whether a type string like
+// "*os.PathError" or "syscall.Errno" refers to an exported type.
+func isExportedError(typeName string) bool {
+	// Strip pointer prefix.
+	name := strings.TrimPrefix(typeName, "*")
+	// The type name after the last dot is the identifier.
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		name = name[idx+1:]
+	}
+	if len(name) == 0 {
+		return false
+	}
+	return name[0] >= 'A' && name[0] <= 'Z'
 }

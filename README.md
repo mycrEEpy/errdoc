@@ -13,12 +13,13 @@ go install github.com/mycreepy/errdoc/cmd/errdoc@latest
 ## Usage
 
 ```
-errdoc [-w] <file.go|directory>
+errdoc [-w] [-u] <file.go|directory>
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-w` | Write error types into function doc comments |
+| `-u` | Include unexported error types in output |
 
 ## Examples
 
